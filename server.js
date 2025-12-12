@@ -5,6 +5,7 @@ import dns from 'dns';
 import { promisify } from 'util';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
+import 'dotenv/config';
 
 const { Pool } = pg;
 const dnsLookup = promisify(dns.lookup);
@@ -22,6 +23,52 @@ const io = new Server(httpServer, {
 const port = process.env.PORT || 3000;
 
 let connectedUsers = 0;
+
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW = 5000;
+const RATE_LIMIT_CLEANUP_INTERVAL = 60000;
+
+const leaderboardCache = new Map();
+const CACHE_TTL = 300000;
+
+function cleanupRateLimits() {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [key, timestamp] of rateLimitMap.entries()) {
+        if (now - timestamp > RATE_LIMIT_CLEANUP_INTERVAL) {
+            rateLimitMap.delete(key);
+            cleaned++;
+        }
+    }
+    if (cleaned > 0) {
+        console.log(`${logTimestamp()} Rate limit cleanup: removed ${cleaned} expired entries`);
+    }
+}
+
+function cleanupLeaderboardCache() {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [key, entry] of leaderboardCache.entries()) {
+        if (now - entry.timestamp > CACHE_TTL) {
+            leaderboardCache.delete(key);
+            cleaned++;
+        }
+    }
+    if (cleaned > 0) {
+        console.log(`${logTimestamp()} Leaderboard cache cleanup: removed ${cleaned} expired entries`);
+    }
+}
+
+function invalidateLeaderboardCache() {
+    const size = leaderboardCache.size;
+    leaderboardCache.clear();
+    if (size > 0) {
+        console.log(`${logTimestamp()} Leaderboard cache invalidated: cleared ${size} entries`);
+    }
+}
+
+setInterval(cleanupRateLimits, RATE_LIMIT_CLEANUP_INTERVAL);
+setInterval(cleanupLeaderboardCache, CACHE_TTL);
 
 app.use(cors());
 app.use(express.json());
@@ -146,8 +193,21 @@ async function initDatabase() {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS game_saves (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                slot_id INTEGER NOT NULL CHECK (slot_id BETWEEN 1 AND 3),
+                save_data TEXT NOT NULL,
+                timestamp BIGINT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, slot_id)
+            );
+        `);
+
         const tableTime = Date.now() - tableStart;
-        console.log(`${logTimestamp()} ✓ Runs table ready (${tableTime}ms)`);
+        console.log(`${logTimestamp()} ✓ Runs and Saves tables ready (${tableTime}ms)`);
 
         console.log(`${logTimestamp()} Creating indexes...`);
         const indexStart = Date.now();
@@ -215,6 +275,20 @@ app.post('/api/leaderboard/save', async (req, res) => {
             return res.status(400).json({ error: 'user_id and run_id are required' });
         }
 
+        const rateLimitKey = `${user_id}:${run_id}`;
+        const now = Date.now();
+        const lastRequestTime = rateLimitMap.get(rateLimitKey);
+
+        if (lastRequestTime && (now - lastRequestTime) < RATE_LIMIT_WINDOW) {
+            const remainingTime = Math.ceil((RATE_LIMIT_WINDOW - (now - lastRequestTime)) / 1000);
+            console.log(`${logTimestamp()} POST /api/leaderboard/save - Rate limit exceeded for ${rateLimitKey}, remaining: ${remainingTime}s`);
+            return res.status(429).json({ 
+                error: 'Too Many Requests', 
+                message: `Same user_id:run_id can only be saved once every ${RATE_LIMIT_WINDOW / 1000} seconds`,
+                retryAfter: remainingTime
+            });
+        }
+
         console.log(`${logTimestamp()} POST /api/leaderboard/save - Saving run for user: ${user_id}, run_id: ${run_id}`);
         const result = await pool.query(`
             INSERT INTO runs (user_id, run_id, timestamp, heat, power, money, time_played, layout)
@@ -229,6 +303,9 @@ app.post('/api/leaderboard/save', async (req, res) => {
             RETURNING *
         `, [user_id, run_id, Date.now(), heat || 0, power || 0, money || 0, time || 0, layout || null]);
 
+        rateLimitMap.set(rateLimitKey, now);
+        invalidateLeaderboardCache();
+
         const duration = Date.now() - startTime;
         console.log(`${logTimestamp()} POST /api/leaderboard/save - Success (${duration}ms)`);
         res.json({ success: true, data: result.rows[0] });
@@ -237,6 +314,64 @@ app.post('/api/leaderboard/save', async (req, res) => {
         console.error(`${logTimestamp()} POST /api/leaderboard/save - Error (${duration}ms):`, error.message);
         console.error(`${logTimestamp()} Error code: ${error.code || 'N/A'}`);
         res.status(500).json({ error: 'Failed to save run', message: error.message });
+    }
+});
+
+app.post('/api/saves', async (req, res) => {
+    const startTime = Date.now();
+    try {
+        const { user_id, slot_id, save_data, timestamp } = req.body;
+        
+        if (!user_id || !slot_id || !save_data) {
+            console.log(`${logTimestamp()} POST /api/saves - Bad request: missing required fields`);
+            return res.status(400).json({ error: 'Missing required fields' });
+        }
+        
+        if (slot_id < 1 || slot_id > 3) {
+            console.log(`${logTimestamp()} POST /api/saves - Bad request: invalid slot_id ${slot_id}`);
+            return res.status(400).json({ error: 'Invalid slot_id (1-3)' });
+        }
+
+        const result = await pool.query(`
+            INSERT INTO game_saves (user_id, slot_id, save_data, timestamp)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT(user_id, slot_id) DO UPDATE SET
+                save_data = $3,
+                timestamp = $4
+            RETURNING *
+        `, [user_id, slot_id, save_data, timestamp || Date.now()]);
+        
+        const duration = Date.now() - startTime;
+        console.log(`${logTimestamp()} POST /api/saves - Saved slot ${slot_id} for user ${user_id} (${duration}ms)`);
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        const duration = Date.now() - startTime;
+        console.error(`${logTimestamp()} POST /api/saves - Error (${duration}ms):`, error.message);
+        console.error(`${logTimestamp()} Error code: ${error.code || 'N/A'}`);
+        res.status(500).json({ error: 'Failed to save game', message: error.message });
+    }
+});
+
+app.get('/api/saves/:userId', async (req, res) => {
+    const startTime = Date.now();
+    try {
+        const { userId } = req.params;
+        const result = await pool.query(`
+            SELECT slot_id, timestamp, save_data 
+            FROM game_saves 
+            WHERE user_id = $1 
+            ORDER BY slot_id ASC
+        `, [userId]);
+        
+        const duration = Date.now() - startTime;
+        console.log(`${logTimestamp()} GET /api/saves/${userId} - Found ${result.rows.length} saves (${duration}ms)`);
+        
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        const duration = Date.now() - startTime;
+        console.error(`${logTimestamp()} GET /api/saves/${req.params.userId} - Error (${duration}ms):`, error.message);
+        console.error(`${logTimestamp()} Error code: ${error.code || 'N/A'}`);
+        res.status(500).json({ error: 'Failed to fetch saves', message: error.message });
     }
 });
 
@@ -249,12 +384,27 @@ app.get('/api/leaderboard/top', async (req, res) => {
         const validSorts = ['heat', 'power', 'money', 'timestamp'];
         const sortColumn = validSorts.includes(sortBy) ? sortBy : 'power';
 
-        console.log(`${logTimestamp()} GET /api/leaderboard/top - sortBy: ${sortColumn}, limit: ${limit}`);
+        const cacheKey = `${sortColumn}:${limit}`;
+        const cached = leaderboardCache.get(cacheKey);
+        const now = Date.now();
+
+        if (cached && (now - cached.timestamp) < CACHE_TTL) {
+            const duration = Date.now() - startTime;
+            console.log(`${logTimestamp()} GET /api/leaderboard/top - Cache hit: ${cacheKey} (${duration}ms)`);
+            return res.json({ success: true, data: cached.data });
+        }
+
+        console.log(`${logTimestamp()} GET /api/leaderboard/top - Cache miss: ${cacheKey}, querying database...`);
         const result = await pool.query(`
             SELECT * FROM runs 
             ORDER BY ${sortColumn} DESC 
             LIMIT $1
         `, [limit]);
+
+        leaderboardCache.set(cacheKey, {
+            data: result.rows,
+            timestamp: now
+        });
 
         const duration = Date.now() - startTime;
         console.log(`${logTimestamp()} GET /api/leaderboard/top - Success: ${result.rows.length} rows (${duration}ms)`);
